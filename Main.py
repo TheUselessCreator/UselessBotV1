@@ -1,115 +1,127 @@
 import discord
-import os
-import random
+import requests
 import asyncio
+import os
 from dotenv import load_dotenv
-from discord.ext import commands
+from discord.ext import tasks
+import logging
+import time
 
-# Load environment variables from .env file
+# Load environment variables
 load_dotenv()
+TOKEN = os.getenv('DISCORD_TOKEN')
+CHANNEL_ID = int(os.getenv('CHANNEL_ID'))
+STATUS_URL = os.getenv('STATUS_URL')
 
-# Define intents for the bot
+# Status Indicator Emojis
+STATUS_EMOJIS = {
+    'operational': '🟢',
+    'degraded': '🟡',
+    'down': '🔴'
+}
+
+# Cooldown settings and uptime tracking
+last_check_time = 0
+COOLDOWN_PERIOD = 300  # 5 minutes in seconds
+uptime_history = []  # Stores 1 for "up" and 0 for "down"
+
+# Set up logging for errors and security alerts
+logging.basicConfig(level=logging.INFO, filename="bot_security.log", filemode="a",
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Function to fetch the status from the API
+def check_status():
+    try:
+        response = requests.get(STATUS_URL)
+        response.raise_for_status()
+        data = response.json()
+        return data.get("status")
+    except requests.RequestException as e:
+        logging.error(f"Error fetching status: {e}")
+        return None
+
+# Calculate average uptime as a percentage
+def calculate_average_uptime():
+    if not uptime_history:
+        return 100.0  # Assume 100% if no data
+    return (sum(uptime_history) / len(uptime_history)) * 100
+
+# Set up the Discord client
 intents = discord.Intents.default()
-intents.members = True  # Enable the member intent to access guild members
-intents.messages = True  # Enable message intents for commands
+intents.message_content = True
+client = discord.Client(intents=intents)
 
-# Define the Discord bot class
-class MyBot(commands.Bot):  # Change Client to Bot
-    def __init__(self, owner_id, invite_link, *args, **kwargs):
-        super().__init__(command_prefix='/', intents=intents, *args, **kwargs)  # Pass intents and command prefix here
-        self.owner_id = owner_id  # Store the owner ID
-        self.invite_link = invite_link  # Store the invite link
-        self.blacklisted_users = self.load_blacklisted_users()  # Load blacklisted user IDs from file
+@client.event
+async def on_ready():
+    print(f'Logged in as {client.user}')
+    channel = client.get_channel(CHANNEL_ID)
+    await client.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="pella.app"))
 
-    def load_blacklisted_users(self):
-        # Load user IDs from user.txt file and return as a set
+    # Send initial message or find the last message
+    async for message in channel.history(limit=10):
+        if message.author == client.user:
+            client.message_to_edit = message
+            break
+    else:
+        client.message_to_edit = await channel.send("🔄 Checking status...")
+
+    update_status.start()
+
+# Task to update the message periodically
+@tasks.loop(minutes=5)
+async def update_status():
+    global last_check_time
+    
+    # Anti-spam cooldown check
+    current_time = time.time()
+    if current_time - last_check_time < COOLDOWN_PERIOD:
+        logging.warning("Cooldown active. Skipping status check.")
+        return
+    last_check_time = current_time
+
+    # Temporarily show "Checking status..." status
+    await client.change_presence(activity=discord.Game(name="🔄 Checking status..."))
+    status = check_status()
+    
+    # Track uptime: record 1 if "operational" or "degraded", otherwise 0
+    if status == 'operational' or status == 'degraded':
+        uptime_history.append(1)
+    else:
+        uptime_history.append(0)
+
+    # Calculate average uptime
+    average_uptime = calculate_average_uptime()
+
+    emoji = STATUS_EMOJIS.get(status, '❓')
+    status_text = {
+        'operational': 'Fully operational',
+        'degraded': 'Operating with some issues',
+        'down': 'Service is down'
+    }.get(status, 'Unknown status')
+
+    # Update message in the Discord channel
+    if client.message_to_edit:
         try:
-            with open('user.txt', 'r') as f:
-                return {line.strip() for line in f.readlines() if line.strip()}  # Remove whitespace and empty lines
-        except FileNotFoundError:
-            print("user.txt not found. No users will be blacklisted.")
-            return set()
+            await client.message_to_edit.edit(content=f"{emoji} Status: {status_text}\n📊 Average Uptime: {average_uptime:.2f}%")
+        except discord.HTTPException as e:
+            logging.error(f"Error updating message: {e}")
 
-    async def on_ready(self):
-        print(f'Logged in as {self.user}')
-        await self.sync_commands()  # Sync commands with Discord
-        await self.update_presence()  # Update presence when bot is ready
-        self.update_presence_task = self.loop.create_task(self.update_presence_loop())  # Start the presence update task
-        
-        # Load all cogs (commands)
-        for filename in os.listdir('./commands'):
-            if filename.endswith('.py'):
-                self.load_extension(f'commands.{filename[:-3]}')
+    # Reset to "Watching pella.app" status
+    await client.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="pella.app"))
 
-        # Access the guild (server)
-        for guild in self.guilds:
-            print(f'Connected to server: {guild.name}')
-            await self.message_random_members(guild)
+# Enhanced shutdown function for security
+async def shutdown_bot():
+    logging.critical("Security alert triggered: Shutting down bot.")
+    await client.close()
 
-    async def sync_commands(self):
-        # Sync commands with Discord
-        synced_commands = await self.tree.sync()  # Sync the command tree
-        print(f"Synced {len(synced_commands)} commands.")
+@client.event
+async def on_error(event, *args, **kwargs):
+    logging.error(f"Error in event {event}: {args} {kwargs}")
+    await shutdown_bot()
 
-    async def update_presence(self):
-        # Set the bot's status to show the number of servers
-        server_count = len(self.guilds)
-        activity = discord.Activity(type=discord.ActivityType.watching, name=f"I'm in {server_count} servers")
-        await self.change_presence(status=discord.Status.online, activity=activity)  # Set status to online with activity
+@client.event
+async def on_disconnect():
+    logging.warning("Bot disconnected unexpectedly.")
+    await shutdown_bot()
 
-    async def update_presence_loop(self):
-        while True:
-            await self.update_presence()  # Update the presence
-            await asyncio.sleep(60)  # Wait for one minute (60 seconds) before updating again
-
-    async def message_random_members(self, guild):
-        while True:
-            # Get all members of the guild (server)
-            members = guild.members
-
-            # Filter out bot accounts (optional)
-            real_users = [member for member in members if not member.bot]
-
-            # Select a random real user
-            if not real_users:
-                print("No real users available to message.")
-                await asyncio.sleep(3600)  # Wait for an hour before retrying
-                continue
-
-            random_member = random.choice(real_users)
-
-            # Check if the random member is blacklisted
-            if str(random_member.id) in self.blacklisted_users:
-                print(f"Skipping blacklisted user: {random_member.name}")
-                continue  # Skip this user and select another
-
-            # Send a DM to the randomly selected user
-            try:
-                await random_member.send(
-                    f"Hey! This is UselessBot. Invite me to make it so I'm the most used bot! "
-                    f"Here's my link if needed: {self.invite_link}\n"
-                )
-                print(f"Message sent to {random_member.name}")
-
-                # Notify the owner about the message sent
-                owner = await self.fetch_user(self.owner_id)  # Fetch the owner user object
-                await owner.send(f"Message sent to: {random_member.name}")
-
-            except Exception as e:
-                print(f"Failed to send message: {e}")
-
-            # Wait for one hour (3600 seconds) before sending the next message
-            await asyncio.sleep(3600)
-
-# Fetch the owner ID from the .env file
-owner_id = int(os.getenv("OWNER_ID"))  # Convert to int
-
-# Load the client ID from the .env file
-client_id = os.getenv("CLIENT_ID")  # Fetch the client ID
-
-# Create the invite link with only the "Add Reactions" permission
-invite_link = f"https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=64&scope=bot"
-
-# Initialize and run the bot
-bot = MyBot(owner_id, invite_link)
-bot.run(os.getenv("DISCORD_TOKEN"))
+client.run(TOKEN)
